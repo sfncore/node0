@@ -61,6 +61,14 @@ A fully autonomous agent that knows Gas Town conventions, workflows, and tooling
 | Task specialization | LoRA adapters | Stackable task-specific adapters (bead-creation, code-review, git-workflow, planning) switchable at inference |
 | Training approach | Distributed via node0 | Node0 IS the distributed training infrastructure — Hivemind DHT, gradient averaging, pipeline parallelism |
 | Training hardware | External GPU infrastructure | Not on the 10GB dev box. Proper GPU nodes for training |
+| Inference | Decentralized via Hivemind/node0 | Same infrastructure serves both training AND inference. Not a local binary. |
+| RAG system | Embedded vector DB (ChromaDB) | Indexes beads, configs, recent sessions. Injected into context at inference time. |
+| Corpus export | Bead-linked export (primary) | Session transcripts attached to bead on close. Supplemented by other methods for wisps/gaps. |
+| Conflict resolution | Recency wins | Most recent version of any artifact takes precedence in corpus. Older entries auto-excluded. |
+| Validation strategy | Progressive rollout IS the validation | No separate shadow/canary. Eval suite + progressive replacement (deacon → witness → polecat) is sufficient. |
+| Cross-rig data | Opt-in per rig | Each rig explicitly enables corpus sharing. Default is rig-local only. |
+| Safety | Standard Gas Town guardrails | GUPP violations, failing to submit MRs, standard gt conventions. Enforced via eval suite. |
+| Eval thresholds | Deferred to implementation | Pick thresholds empirically after first training run. Can't know what's reasonable until real numbers exist. |
 | Preference learning | DPO in V1 | Successful vs failed polecat sessions as preference pairs |
 | Dynamic content | RAG complement | Fine-tune for behavior/conventions, RAG for evolving state (current beads, configs, recent context) |
 | Data freshness | Retrain ASAP + RAG gap | Retrain when significant new data arrives. RAG covers the gap between training snapshots |
@@ -336,13 +344,73 @@ New model trained --> eval suite runs --> score >= threshold?
 - Self-hosted inference (compute cost only, no per-token API pricing)
 - Session auto-exported to corpus on close, scrubbed and tagged by role/task
 
+## Inference Architecture
+
+Node0 serves both training AND inference via Hivemind's decentralized infrastructure. The same peer network used for gradient averaging during training serves model inference in production.
+
+```
+Agent tmux session
+  --> node0-inference client (stdin/stdout, tmux-compatible)
+  --> Hivemind DHT discovers inference peers
+  --> Distributed inference across pipeline stages
+  --> Response streamed back to agent session
+```
+
+This means inference is not a local binary running on the 10GB dev box — it's a distributed operation across GPU nodes in the Hivemind network. The `node0` provider in town settings connects to the DHT to route inference requests.
+
+## RAG Architecture
+
+Embedded vector DB (ChromaDB) complements the fine-tuned model with dynamic state:
+
+```
+Fine-tuned model knows:              RAG injects:
+- Gas Town conventions                - Current bead state (open/blocked/ready)
+- gt/bd command patterns              - Recent config changes
+- Formula structure                   - Active rig assignments
+- Sling lifecycle                     - Latest CLAUDE.md updates since training
+- Bead dependency rules               - Session context from related beads
+```
+
+**Indexing**: ChromaDB indexes beads, configs, recent sessions, and formula definitions. Updated on every `bd sync` and config change.
+
+**Retrieval at inference**: When the node0 agent receives a prompt, relevant context is retrieved from ChromaDB and prepended to the prompt — similar to how `gt prime` works today, but smaller and more targeted.
+
+**Benefit**: The model's fine-tuned knowledge handles ~80% of context. RAG fills the remaining ~20% that changes between training runs. This dramatically reduces the context injection compared to current `gt prime` (~15K tokens → estimated ~2-3K tokens of RAG context).
+
+## Corpus Collection Mechanism
+
+**Primary: Bead-linked export**
+
+When a polecat bead closes, its session transcript is automatically attached to the bead:
+
+```
+Polecat session completes
+  --> gt hook (session_shutdown) fires
+  --> Transcript extracted from tmux session
+  --> Scrubbed (automated PII removal)
+  --> Tagged with: role, rig, bead ID, task type, outcome (success/fail)
+  --> Stored as corpus entry linked to the bead
+  --> Available for next training run
+```
+
+**Supplementary: Wisp and gap coverage**
+
+Wisps and non-bead sessions (mayor interactions, ad-hoc crew work) are captured via:
+- Periodic batch export scanning tmux session logs
+- Manual `gt corpus add` command for curated examples
+- Formula-triggered export for spec/brainstorm sessions
+
+**Cross-rig sharing**: Opt-in per rig. Each rig must explicitly enable corpus sharing via rig settings. Default is rig-local only.
+
+**Conflict resolution**: When corpus contains contradictory entries (e.g., old vs new CLAUDE.md conventions), recency wins. Most recent version takes precedence; older conflicting entries are auto-excluded or down-weighted during training.
+
 ## Open Questions (Carry to Implementation)
 
 1. **Rig structure (Q52)**: Where does training infra vs corpus collection live? Dedicated node0 rig, embedded in each rig, or hybrid? Needs investigation.
-2. **Inference serving**: How does the `node0-inference` binary wrap the model for tmux agent usage? What's the interface contract?
-3. **Exact node0 code changes**: Specific modifications needed in node0 for data loading, checkpoint export, LoRA support.
-4. **LoRA framework**: PEFT, Unsloth, or other? Benchmarking decision deferred to implementation.
-5. **Tokenizer**: Efficiency for Gas Town-specific vocabulary (gt commands, bead IDs, formula syntax). Custom tokens or rely on base tokenizer?
+2. **Exact node0 code changes**: Specific modifications needed in node0 for data loading, checkpoint export, LoRA support, and inference serving.
+3. **LoRA framework**: PEFT, Unsloth, or other? Benchmarking decision deferred to implementation.
+4. **Tokenizer**: Efficiency for Gas Town-specific vocabulary (gt commands, bead IDs, formula syntax). Custom tokens or rely on base tokenizer?
+5. **ChromaDB integration**: Where does the vector DB live? Per-rig or centralized? How does it integrate with the inference pipeline?
 
 ## Out of Scope (V2+)
 
@@ -381,3 +449,45 @@ All decisions made during the brainstorm session on 2026-02-21:
 | Q64 | Task-specific tuning | Yes, LoRA adapters in V1 | Stackable on base role models |
 | Q70 | Model registry | Full UI in V1 | CLI + browsable UI |
 | Q75 | Planning assistance | Core V1 use case | Bead hierarchies, effort estimation, deps |
+
+### Spec Review Additions (2026-02-21)
+
+| # | Question | Decision | Notes |
+|---|----------|----------|-------|
+| - | Eval thresholds | Deferred to implementation | Pick empirically after first training run |
+| - | Inference architecture | Decentralized via Hivemind/node0 | Same infra for training AND inference |
+| - | RAG system | Embedded vector DB (ChromaDB) | Indexes beads, configs, sessions |
+| - | Corpus export mechanism | Bead-linked export (primary) | Supplemented by batch export for wisps/gaps |
+| - | Contradictory corpus handling | Recency wins | Older conflicting entries auto-excluded |
+| - | Production validation | Progressive rollout IS the validation | No separate shadow/canary needed |
+| - | Cross-rig data sharing | Opt-in per rig | Default is rig-local only |
+| - | Safety criteria | Standard Gas Town guardrails | GUPP violations, MR submission, gt conventions |
+
+## Spec Review
+
+**Reviewed:** 2026-02-21
+**Gaps identified:** 9 (5 critical, 4 important)
+**Gaps resolved:** 9
+
+### Clarifications Added
+
+| Topic | Clarification |
+|-------|---------------|
+| Eval thresholds | Deferred — pick empirically after first training run |
+| Inference | Decentralized via Hivemind/node0, not a local binary |
+| RAG | ChromaDB embedded vector DB, indexes beads/configs/sessions |
+| Corpus export | Bead-linked on close (primary), batch export for wisps/gaps |
+| Conflicts | Recency wins for contradictory corpus entries |
+| Validation | Progressive rollout (deacon → witness → polecat) IS the validation |
+| Data sharing | Opt-in per rig, default rig-local only |
+| Safety | Standard Gas Town guardrails (GUPP, MRs, conventions) via eval |
+
+### Deferred Items
+
+| Item | Rationale | Revisit When |
+|------|-----------|--------------|
+| Eval score thresholds | Need real training data first | After first training run |
+| Rig structure (Q52) | Multiple viable options | Implementation planning |
+| LoRA framework selection | Benchmarking needed | Implementation |
+| Tokenizer customization | Depends on base model | After base model selected |
+| ChromaDB integration details | Depends on inference architecture | Implementation |
