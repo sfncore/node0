@@ -258,15 +258,17 @@ Training runs on proper GPU infrastructure, not the 10GB dev box. GPU-less opera
 
 ## Model Registry & Deployment
 
-### Model Registry (Full UI in V1)
+### Model Registry (CLI in V1; browsable UI deferred to V2)
 
-A browsable registry showing all trained models, their lineage, eval scores, and deployment status across rigs.
+A registry showing all trained models, their lineage, eval scores, and deployment status across rigs. The V1 implementation is **CLI-only** — `gt model list`, `show`, `deploy`, `rollback`, `prune`. A browsable web or TUI registry UI is deferred to V2.
+
+> **Note (added during plan review, 2026-02-22):** The original spec decision Q70 stated "Full UI in V1 — CLI + browsable UI". During plan review, it was determined that building a browsable UI in V1 would add significant scope with low immediate value. The V1 scope is revised: CLI-only registry interface, browsable UI deferred to V2. The CLI delivers the core value (queryable metadata, deployment control, rollback). See Decision Log entry Q70-revised below.
 
 **Storage design (to be detailed in implementation):**
 - Model artifacts (weights, adapters): file-based storage under `~/gt/.models/` or configurable path
 - Metadata (lineage, eval scores, deployment status): Dolt table in HQ database
 - Schema must track: model name, role, base model, version, training corpus hash, eval scores per category, LoRA adapters, deployment status per rig, creation timestamp
-- The full UI is a product feature — implementation plan should scope it as its own epic
+- The full browsable UI is a V2 product feature
 
 **CLI interface:**
 
@@ -545,6 +547,12 @@ All decisions made during the brainstorm session on 2026-02-21:
 | Q64 | Task-specific tuning | Yes, LoRA adapters in V1 | Stackable on base role models |
 | Q70 | Model registry | Full UI in V1 | CLI + browsable UI |
 | Q75 | Planning assistance | Core V1 use case | Bead hierarchies, effort estimation, deps |
+
+### Plan Review Additions (2026-02-22)
+
+| # | Question | Decision | Notes |
+|---|----------|----------|-------|
+| Q70-revised | Model Registry UI scope | CLI-only in V1; browsable UI deferred to V2 | Original Q70 decision ("Full UI in V1") revised during plan review. CLI commands (`gt model list/show/deploy/rollback/prune`) deliver the core value. Browsable UI adds significant scope with low immediate value — deferred. |
 
 ### Spec Review Additions (2026-02-21)
 
