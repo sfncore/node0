@@ -24,44 +24,58 @@ A fully autonomous agent that knows Gas Town conventions, workflows, and tooling
 ## Architecture
 
 ```
-+-----------------------------------------------------+
-|                Gas Town Orchestration                 |
-|  +----------+  +----------+  +-------------------+  |
-|  | Corpus    |  | Training |  | Model Registry    |  |
-|  | Pipeline  |  | Formulas |  | (UI + CLI + API)  |  |
-|  +-----+----+  +-----+----+  +---------+---------+  |
-|        |              |                 |            |
-|        v              v                 v            |
-|  +----------------------------------------------+   |
-|  |             node0 Training Layer              |   |
-|  |  Hivemind DHT | Gradient Avg | Pipeline Par.  |   |
-|  +----------------------------------------------+   |
-|        |                              |              |
-|        v                              v              |
-|  +----------+                +----------------+      |
-|  | Role-     |                | Task-specific  |      |
-|  | specific  |                | LoRA adapters  |      |
-|  | models    |                | (stackable)    |      |
-|  +----------+                +----------------+      |
-|        |                                             |
-|        v                                             |
-|  +----------------------------------------------+   |
-|  |      New Provider: "node0" in town settings   |   |
-|  |  Replaces: deacon > witness > polecat > crew  |   |
-|  +----------------------------------------------+   |
-+-----------------------------------------------------+
++------------------------------------------------------------------+
+|                    Gas Town Orchestration                          |
+|  +----------+  +----------+  +-------------------+               |
+|  | Corpus    |  | Training |  | Model Registry    |               |
+|  | Pipeline  |  | Formulas |  | (UI + CLI + API)  |               |
+|  +-----+----+  +-----+----+  +---------+---------+               |
+|        |              |                 |                          |
+|        v              v                 v                          |
+|  +----------------------------------------------+                |
+|  |             node0 Training Layer              |                |
+|  |  Hivemind DHT | Gradient Avg | Pipeline Par.  |                |
+|  +----------------------------------------------+                |
+|        |                              |                           |
+|        v                              v                           |
+|  +----------+                +----------------+                   |
+|  | Role-     |                | Task-specific  |                   |
+|  | specific  |                | LoRA adapters  |                   |
+|  | models    |                | (stackable)    |                   |
+|  +-----+----+                +-------+--------+                   |
+|        |                              |                           |
+|        v                              v                           |
+|  +----------------------------------------------+                |
+|  |        node0 Inference Pipeline               |                |
+|  | gRPC pipeline fwd | Autoregressive loop      |                |
+|  | Sampling | KV-cache | Prompt API              |                |
+|  +---------------------+------------------------+                |
+|                         |                                         |
+|                    +----+----+                                    |
+|                    | ChromaDB |   <-- RAG: beads, configs,        |
+|                    | (RAG)    |       sessions, formulas           |
+|                    +----+----+                                    |
+|                         |                                         |
+|                         v                                         |
+|  +----------------------------------------------+                |
+|  |      New Provider: "node0" in town settings   |                |
+|  |  Replaces: deacon > witness > polecat > crew  |                |
+|  +----+-----------------------------------------+                |
+|       |                                                           |
+|       +-----> Session logs -----> Corpus Pipeline (feedback loop) |
++------------------------------------------------------------------+
 ```
 
 ### Key Architectural Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Base model | Model-agnostic | Try multiple (LLaMA, Qwen, etc.), compare, pick winners per role |
+| Base model | Model-agnostic (V1 scoped to LLaMA family) | Try multiple long-term; V1 uses LLaMA since node0 only has LLaMA model defs. Adding new architectures requires new model layers, args classes, pipeline stage defs. |
 | Model specialization | Role-specific | Separate models for mayor, polecat, witness, deacon — different training data and behavior |
 | Task specialization | LoRA adapters | Stackable task-specific adapters (bead-creation, code-review, git-workflow, planning) switchable at inference |
 | Training approach | Distributed via node0 | Node0 IS the distributed training infrastructure — Hivemind DHT, gradient averaging, pipeline parallelism |
 | Training hardware | External GPU infrastructure | Not on the 10GB dev box. Proper GPU nodes for training |
-| Inference | Decentralized via Hivemind/node0 | Same infrastructure serves both training AND inference. Not a local binary. |
+| Inference | Decentralized via node0 pipeline forwarding | node0's forward pass through pipeline stages IS inference. Must add: autoregressive generation loop, prompt API, sampling logic. Not a separate system — extends existing gRPC pipeline. |
 | RAG system | Embedded vector DB (ChromaDB) | Indexes beads, configs, recent sessions. Injected into context at inference time. |
 | Corpus export | Bead-linked export (primary) | Session transcripts attached to bead on close. Supplemented by other methods for wisps/gaps. |
 | Conflict resolution | Recency wins | Most recent version of any artifact takes precedence in corpus. Older entries auto-excluded. |
@@ -69,7 +83,7 @@ A fully autonomous agent that knows Gas Town conventions, workflows, and tooling
 | Cross-rig data | Opt-in per rig | Each rig explicitly enables corpus sharing. Default is rig-local only. |
 | Safety | Standard Gas Town guardrails | GUPP violations, failing to submit MRs, standard gt conventions. Enforced via eval suite. |
 | Eval thresholds | Deferred to implementation | Pick thresholds empirically after first training run. Can't know what's reasonable until real numbers exist. |
-| Preference learning | DPO in V1 | Successful vs failed polecat sessions as preference pairs |
+| Preference learning | DPO via Dolt branching | Same task slung to two models → two Dolt branches → user/rig picks winner → preference pairs collected at task level. No simultaneous forward passes needed. |
 | Dynamic content | RAG complement | Fine-tune for behavior/conventions, RAG for evolving state (current beads, configs, recent context) |
 | Data freshness | Retrain ASAP + RAG gap | Retrain when significant new data arrives. RAG covers the gap between training snapshots |
 | Provider integration | New "node0" provider | Registered in town settings alongside claude, pi, omp |
@@ -101,7 +115,7 @@ A fully autonomous agent that knows Gas Town conventions, workflows, and tooling
 ### Corpus Pipeline
 
 ```
-1. COLLECT              2. SCRUB                3. FORMAT               4. PARTITION
+1. COLLECT              2. SCRUB                3. FORMAT               4. PARTITION (data)
 Session logs       -->  Automated PII      -->  Role-tagged        -->  By role:
 Bead history            removal:                instruction pairs:      - mayor corpus
 Config files            - Credentials           - system prompt         - polecat corpus
@@ -115,9 +129,14 @@ gt prime output         - IP addresses          - assistant turn        By task:
 
 ### Data Characteristics
 
-- **Volume**: 1K-10K examples initially
+- **Volume**: 1K-10K examples initially (note: split across 4+ roles = 250-2500 per role per model. Published research suggests 10K+ for a single task. Volume will grow over time as more sessions are captured — initial runs may underperform until corpus matures)
 - **Formats**: Mixed — structured JSON, markdown, conversation logs
-- **Scrubbing**: Fully automated pipeline (regex + pattern matching for credentials, API keys, tokens, IP addresses). No manual review step.
+- **Scrubbing**: Multi-layer automated pipeline:
+  1. Secret scanning tool (truffleHog or detect-secrets) for JWTs, PEM blocks, inline secrets
+  2. Regex patterns for API keys, tokens, IP addresses, file paths
+  3. Confidence-based flagging for uncertain matches (quarantine, don't silently include)
+  4. Periodic audit/sampling of scrubbed output to catch novel credential formats
+  - No manual review of every entry, but automated quality gates prevent silent credential leakage.
 - **Data retention**: No post-training removal. No right-to-be-forgotten requirement.
 
 ### Extensibility Path
@@ -132,23 +151,59 @@ gt prime output         - IP addresses          - assistant turn        By task:
 
 **Exists in node0 (use as-is):**
 - Hivemind DHT peer discovery
-- Decentralized gradient averaging
-- PowerSGD compression
-- Pipeline parallelism
-- PluralisAuthorizer
+- gRPC pipeline forwarding (activations between stages)
 - YAML config system
-- AutoStepOptimizer
-- MonitorWorker metrics
 
-**Must be built:**
-- Data loading pipeline (node0 has NO data loading currently)
-- Checkpoint export (safetensors + GGUF formats)
-- LoRA adapter support
-- Corpus partitioning per pipeline stage
-- Training job lifecycle mapped to beads
-- Pause/resume capability
-- DPO training loop
-- Multi-model experiment tracking
+**Exists in node0 (needs modification for fine-tuning):**
+- Decentralized gradient averaging — works for pretraining, needs adaptation for LoRA-only gradients
+- PowerSGD compression — for gradient bandwidth reduction, not model compression
+- Pipeline parallelism — each node runs 1 of 32 layers; LoRA adapters must be applied per-stage
+- PluralisAuthorizer — requires auth.pluralis.ai and assigns pipeline stages; needs to be made optional or replaceable for self-hosted fine-tuning
+- AutoStepOptimizer — auto-triggers steps on timer, kills process on NaN grads (`os.killpg`); needs fine-tuning-aware step scheduling and graceful error handling
+- MonitorWorker — provides infrastructure metrics; needs training-specific metrics (loss, eval scores, corpus stats)
+
+**Must be built (major subsystems):**
+
+1. **Data loading pipeline (EPIC — largest engineering task)**
+   - node0 has ZERO data loading. No DataLoader, no dataset abstraction, no tokenizer integration, no loss computation
+   - The training loop is entirely external — GradientAverager expects gradients to already exist in `param.grad`
+   - Sub-tasks: tokenizer integration, dataset format definition, DataLoader implementation, loss function (cross-entropy for SFT, DPO loss for preference), batch assembly, integration with pipeline-parallel architecture
+
+2. **Checkpoint export and model assembly**
+   - `checkpoint_dir=None` is hardcoded in `node0_server.py`. No save mechanism exists
+   - Model exists only in distributed memory across 32 pipeline stages — no single node has the full model
+   - Must: gather distributed weights from all pipeline stages, assemble into single state dict, serialize to safetensors + GGUF
+   - Architecturally complex due to pipeline-parallel splitting
+
+3. **LoRA adapter support (per pipeline stage)**
+   - ModelArguments has no LoRA fields (rank, alpha, target_modules, dropout)
+   - Must apply LoRA wrapping per pipeline stage, not globally
+   - Optimizer must operate on adapter params only, not all params
+   - Framework selection (PEFT, Unsloth) deferred to implementation
+
+4. **Autoregressive inference (generation loop + prompt API)**
+   - node0's forward pass through pipeline stages IS inference — gRPC moves activations between stages
+   - Missing: autoregressive token generation loop, sampling/temperature/top-p, prompt-in/response-out API
+   - This is a moderate addition to node0's existing pipeline forwarding, not a separate system
+
+5. **DPO preference collection via Dolt branching**
+   - Same task slung to two model versions → both produce Dolt branches → user/rig picks better outcome
+   - Winner = "chosen", loser = "rejected" → preference pairs at task level
+   - Periodically retrain with accumulated preferences
+   - No simultaneous reference+policy forward passes needed (unlike standard ML DPO)
+
+6. **Training job lifecycle mapped to beads**
+   - Bead states: `corpus-validating` → `ready` → `training` → `syncing` → `checkpointing` → `evaluating` → `done` / `failed` / `degraded`
+   - Must handle: partial failures, straggler peers, checkpoint resume, peer loss during training
+
+7. **Multi-model experiment tracking**
+8. **Corpus data validation and quality gates**
+   - Quality scoring before corpus inclusion
+   - Anomaly detection on new additions
+   - Provenance tracking (which session/user/rig generated each example)
+   - Model poisoning prevention — especially critical for V1+ multi-operator extension
+
+**Note on vocab_size:** Current `LlamaArguments` has `vocab_size: int = 50265` (OPT-2.7b tokenizer), not LLaMA's standard 32000/128256. Must be clarified/fixed before fine-tuning.
 
 ### Training Job Lifecycle (Bead-Mapped)
 
@@ -165,7 +220,9 @@ Training jobs are first-class beads — tracked, queryable, with full dependency
 
 ### Training Configuration via Formulas
 
-Training runs are configured through Gas Town formulas — composable, versionable, shareable:
+Training runs are configured through Gas Town formulas — composable, versionable, shareable.
+
+**Note**: The formula below is illustrative of the workflow structure. Concrete command mappings (what each step actually executes) will be defined during implementation once the node0 training CLI and data loading interfaces are built. The steps map to the training pipeline but the exact `command` fields are TBD.
 
 ```toml
 [formula]
@@ -180,15 +237,19 @@ lora_rank = { type = "int", default = 64 }
 
 [steps.prepare]
 description = "Partition corpus, validate format, generate node0 YAML config"
+# command TBD — depends on corpus pipeline and node0 config generation tooling
 
 [steps.train]
 description = "Launch node0 distributed training job"
+# command TBD — depends on node0 training CLI (data loader, LoRA config)
 
 [steps.eval]
 description = "Run automated task suite against checkpoint"
+# command TBD — depends on eval framework and checkpoint export
 
 [steps.export]
 description = "Export to safetensors + GGUF, register in model registry"
+# command TBD — depends on checkpoint gathering and model registry CLI
 ```
 
 ### Hardware
@@ -200,6 +261,12 @@ Training runs on proper GPU infrastructure, not the 10GB dev box. GPU-less opera
 ### Model Registry (Full UI in V1)
 
 A browsable registry showing all trained models, their lineage, eval scores, and deployment status across rigs.
+
+**Storage design (to be detailed in implementation):**
+- Model artifacts (weights, adapters): file-based storage under `~/gt/.models/` or configurable path
+- Metadata (lineage, eval scores, deployment status): Dolt table in HQ database
+- Schema must track: model name, role, base model, version, training corpus hash, eval scores per category, LoRA adapters, deployment status per rig, creation timestamp
+- The full UI is a product feature — implementation plan should scope it as its own epic
 
 **CLI interface:**
 
@@ -281,22 +348,36 @@ Each stage gated by automated eval suite before promotion:
 
 Gates every model before deployment. Must pass threshold to enter registry as deployable.
 
-| Task Category | Example Tasks | Pass Criteria |
-|---------------|---------------|---------------|
-| Bead management | Create issue from description; close with reason; build epic hierarchy | Correct fields, deps, status transitions |
-| Git workflow | Branch, commit, push; generate PR description; resolve merge conflict | No --force, hooks pass, clean merge |
-| Convention adherence | Use gt commands; follow CLAUDE.md; respect resource constraints | No pkill, role-appropriate behavior |
-| Planning | Generate bead hierarchy; estimate complexity; suggest deps | Deps enable parallelism, no cycles |
-| Code execution | Implement from bead description; fix bug; refactor | Tests pass, no regressions |
+**Scoring methodology**: Each eval task produces a binary pass/fail or numeric score (0-100). Category scores are the percentage of tasks passed. Overall eval score = weighted average across categories (weights TBD after first training run). Thresholds are deferred to implementation — pick empirically after real numbers exist — but the methodology is fixed: automated, reproducible, per-category scoring with a composite gate.
 
-### DPO Training Signal
+| Task Category | Example Tasks | Pass Criteria | Scoring |
+|---------------|---------------|---------------|---------|
+| Bead management | Create issue from description; close with reason; build epic hierarchy | Correct fields, deps, status transitions | Binary per-field + structural validation |
+| Git workflow | Branch, commit, push; generate PR description; resolve merge conflict | No --force, hooks pass, clean merge | Binary per-step, merge quality score |
+| Convention adherence | Use gt commands; follow CLAUDE.md; respect resource constraints | No pkill, role-appropriate behavior | Binary per-convention violation count |
+| Planning | Generate bead hierarchy; estimate complexity; suggest deps | Deps enable parallelism, no cycles | Cycle-free + parallelism ratio |
+| Code execution | Implement from bead description; fix bug; refactor | Tests pass, no regressions | Test pass rate + regression count |
 
-| Source | Signal |
-|--------|--------|
-| Successful polecat session | Chosen response (model should emulate) |
-| Failed polecat session | Rejected response (model should avoid) |
+### DPO via Dolt Branching (Task-Level Preference Learning)
 
-Failure modes captured: timeout, wrong branch, broke tests, ignored conventions, memory crash, skipped hooks, wrong dependency direction.
+Instead of standard ML DPO (which requires simultaneous reference + policy model forward passes — extremely complex in pipeline-parallel), Gas Town uses a practical approach:
+
+```
+1. Same task slung to two model versions (or model A vs model B)
+2. Both produce Dolt branches with their work
+3. User/rig evaluates and picks the better outcome
+4. Winner = "chosen", Loser = "rejected"
+5. Preference pairs accumulated over time
+6. Periodically retrain with collected preferences
+```
+
+**Advantages over standard DPO:**
+- No reference model forward pass needed (no 2x pipeline overhead)
+- Preferences collected at task level (what matters for Gas Town), not token level
+- Natural integration with existing sling/polecat workflow
+- Uses Dolt branching which already exists
+
+**Failure modes captured for rejected signal:** timeout, wrong branch, broke tests, ignored conventions, memory crash, skipped hooks, wrong dependency direction.
 
 ### Model Staleness Detection
 
@@ -346,17 +427,32 @@ New model trained --> eval suite runs --> score >= threshold?
 
 ## Inference Architecture
 
-Node0 serves both training AND inference via Hivemind's decentralized infrastructure. The same peer network used for gradient averaging during training serves model inference in production.
+Node0's forward pass through pipeline stages IS inference. The gRPC infrastructure that moves activations between stages during training is the same infrastructure needed for inference. What must be ADDED is the autoregressive generation loop.
+
+**What exists (reusable for inference):**
+- gRPC pipeline forwarding between stages (head → body → tail)
+- Hivemind DHT for peer discovery
+- Pipeline stage activation passing
+
+**What must be built:**
+- Autoregressive generation loop (decode one token → feed back → repeat)
+- Prompt API (prompt-in/response-out endpoint for tmux agent usage)
+- Sampling logic (temperature, top-p, top-k)
+- Streaming response back to agent session
+- KV-cache management across pipeline stages
 
 ```
 Agent tmux session
   --> node0-inference client (stdin/stdout, tmux-compatible)
-  --> Hivemind DHT discovers inference peers
-  --> Distributed inference across pipeline stages
+  --> Prompt tokenized, fed into head stage
+  --> Activations flow through all 32 pipeline stages via gRPC
+  --> Tail stage produces next-token logits
+  --> Sampling selects token
+  --> Token fed back into head stage (autoregressive loop)
   --> Response streamed back to agent session
 ```
 
-This means inference is not a local binary running on the 10GB dev box — it's a distributed operation across GPU nodes in the Hivemind network. The `node0` provider in town settings connects to the DHT to route inference requests.
+This is a moderate extension of node0's existing pipeline forwarding — not a separate inference system. The `node0` provider in town settings connects to the DHT to route inference requests to available pipeline peers.
 
 ## RAG Architecture
 
@@ -402,7 +498,7 @@ Wisps and non-bead sessions (mayor interactions, ad-hoc crew work) are captured 
 
 **Cross-rig sharing**: Opt-in per rig. Each rig must explicitly enable corpus sharing via rig settings. Default is rig-local only.
 
-**Conflict resolution**: When corpus contains contradictory entries (e.g., old vs new CLAUDE.md conventions), recency wins. Most recent version takes precedence; older conflicting entries are auto-excluded or down-weighted during training.
+**Conflict resolution**: When corpus contains contradictory entries (e.g., old vs new CLAUDE.md conventions), recency wins. Most recent version takes precedence; older conflicting entries are auto-excluded or down-weighted during training. **Caveat**: if a bad convention is introduced and later reverted, the revert must be explicitly captured as a new corpus entry — otherwise "recency wins" would preserve the bad convention. Corpus pipeline should flag reversions (detecting when a CLAUDE.md change undoes a recent change) for manual review.
 
 ## Open Questions (Carry to Implementation)
 
@@ -491,3 +587,48 @@ All decisions made during the brainstorm session on 2026-02-21:
 | LoRA framework selection | Benchmarking needed | Implementation |
 | Tokenizer customization | Depends on base model | After base model selected |
 | ChromaDB integration details | Depends on inference architecture | Implementation |
+
+## Multi-Model Review
+
+**Reviewed:** 2026-02-21 | **Models:** Opus 4.6, Kimi K2 (omp) | **Full report:** `spec-review.md`
+
+19 issues identified (5 critical, 5 high, 6 medium, 3 low). All 19 addressed in this spec revision.
+
+### Critical Issues Resolved
+
+| # | Issue | Resolution |
+|---|-------|------------|
+| 1 | Hivemind doesn't do inference | Rewritten: node0's forward pass IS inference. Added "What must be built" list (generation loop, prompt API, sampling, KV-cache). |
+| 2 | Data loading is an epic, not a bullet | Elevated to "#1 EPIC — largest engineering task" with 6 sub-tasks. |
+| 3 | Pipeline-parallel breaks fine-tuning assumptions | Documented per-stage LoRA, tail-only loss, 32-stage checkpoint gathering throughout spec. |
+| 4 | Checkpoint export architecturally complex | Detailed as must-build #2 with pipeline gathering + serialization requirements. |
+| 5 | "Use as-is" components need modification | Split into 3 tiers: use as-is (3), needs modification (6 with details), must build (8). |
+
+### High Issues Resolved
+
+| # | Issue | Resolution |
+|---|-------|------------|
+| 6 | DPO requires new architecture | Redesigned as "DPO via Dolt branching" — task-level preference collection using existing infrastructure. |
+| 7 | ChromaDB/RAG has no integration point | RAG Architecture section added with proper integration via inference pipeline. |
+| 8 | PII scrubbing insufficient | Upgraded to multi-layer pipeline: secret scanning + regex + confidence flagging + periodic audit. |
+| 9 | Model poisoning not addressed | Added "Corpus data validation and quality gates" as must-build #8. |
+| 10 | Model registry is entire subsystem | Added storage design note and flagged as its own epic for implementation. |
+
+### Medium/Low Issues Resolved
+
+| # | Issue | Resolution |
+|---|-------|------------|
+| 11 | Model-agnostic contradicted | Scoped V1 to LLaMA family, documented non-trivial effort for new architectures. |
+| 12 | Corpus volume per-role | Added note: 250-2500 per role initially, grows over time. |
+| 13-14 | Eval methodology undefined | Added scoring methodology (binary/numeric per-task, category percentages, weighted composite). |
+| 15 | Corpus partitioning confused | Clarified "PARTITION (data)" label — data by role/task, not pipeline stages. |
+| 16 | Vocab size mismatch | Added note about OPT vs LLaMA vocab_size fix needed. |
+| 17 | Formula syntax aspirational | Added note that command mappings are TBD pending implementation. |
+| 18 | Bead lifecycle oversimplistic | Expanded to 7 states: corpus-validating → ready → training → syncing → checkpointing → evaluating → done/failed/degraded. |
+| 19 | Recency regression risk | Added caveat about reverted conventions needing explicit capture + flagging. |
+
+### Key Design Decisions from Review
+
+1. **Inference = extended forward pass**: Both reviewers said Hivemind can't do inference. User correctly identified that the forward pass IS inference — just needs generation loop added. Moderate addition, not a rewrite.
+2. **DPO via Dolt branching**: User proposed task-level preference collection through existing Dolt branching. Sidesteps the need for simultaneous reference+policy model forward passes entirely.
+3. **Keep distributed pipeline-parallel**: User chose to keep the distributed architecture rather than gather to single node for fine-tuning.
